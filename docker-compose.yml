@@ -1,0 +1,11 @@
+version: '3.8'
+
+services:
+  ozon-agent:
+    build: .
+    container_name: ozon_autonomous_agent
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./data:/app/data
+    restart: always

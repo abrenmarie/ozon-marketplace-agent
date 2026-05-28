@@ -1,0 +1,16 @@
+{
+  "currency": "RUB",
+  "tax_rate": 0.06,
+  "products": {
+    "SKU-IDENTIFIER": {
+      "name": "Product Name",
+      "stock": 50,
+      "cost_price": 500.0,
+      "current_price": 1500.0,
+      "ozon_commission_pct": 0.15,
+      "logistics_fbo": 100.0,
+      "min_margin_pct": 0.20,
+      "target_competitor_sku": "COMP-ID-01"
+    }
+  }
+}
