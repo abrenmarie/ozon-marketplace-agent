@@ -44,16 +44,19 @@ After a successful build, the interactive dashboard web interface will be access
 
 ## Project Structure
 
+## Project Structure
+
+```text
 ozon_smart_agent/
-│
 ├── core/
-│   └── analytics.py        # Computational core, OSINT simulator, and AI engine
+│   └── analytics.py       # Computational core, OSINT simulator, and AI engine
 ├── data/
-│   └── portfolio_ozon.json  # Central SKU registry, cost matrix, and margin limits
-├── app.py                  # Control dashboard powered by Streamlit
-├── requirements.txt        # Python dependency manifest
-├── Dockerfile              # Docker container build configuration
-└── docker-compose.yml      # Local infrastructure virtualization orchestrator
+│   └── portfolio_ozon.json # Central SKU registry, cost matrix, and margin limits
+├── app.py                 # Control dashboard powered by Streamlit
+├── requirements.txt       # Python dependency manifest
+├── Dockerfile             # Docker container build configuration
+└── docker-compose.yml     # Local infrastructure virtualization orchestrator
+```
 
 ## Useful Container Management Commands
 
