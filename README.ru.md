@@ -15,9 +15,7 @@ Ozon Smart Agent — это умный помощник и автопилот д
 Вам больше не нужно считать формулы вручную в Excel. Автопилот сам рассчитывает два ключевых показателя:
 
 1. **Чистая прибыль с единицы товара (Net Profit)**
-$$
-\text{Net Profit} = P_{\text{current}} \cdot (1 - \tau) - C_{\text{cost}} - (P_{\text{current}} \cdot \mu_{\text{ozon}}) - L_{\text{fbo}}
-$$
+$$\text{Net Profit} = P_{\text{current}} \cdot (1 - \tau) - C_{\text{cost}} - (P_{\text{current}} \cdot \mu_{\text{ozon}}) - L_{\text{fbo}}$$
 
 * **$P_{\text{current}}$** — текущая розничная цена товара (₽)
 * **$\tau$** — налоговая ставка (например, `0.06` для УСН 6%)
@@ -26,9 +24,7 @@ $$
 * **$L_{\text{fbo}}$** — расходы на логистику и сборку FBO (₽)
 
 2. **Минимальная цена для защиты маржи ($P_{\text{min}}$)**
-$$
-P_{\text{min}} = \frac{C_{\text{cost}} + L_{\text{fbo}}}{1 - \mu_{\text{ozon}} - \tau - \text{Margin}_{\text{min}}}
-$$
+$$P_{\text{min}} = \frac{C_{\text{cost}} + L_{\text{fbo}}}{1 - \mu_{\text{ozon}} - \tau - \text{Margin}_{\text{min}}}$$
 
 * **$\text{Margin}_{\text{min}}$** — минимально допустимая норма прибыли (например, `0.20` для 20%)
 
