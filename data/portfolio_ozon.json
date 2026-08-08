@@ -12,5 +12,8 @@
       "min_margin_pct": 0.20,
       "target_competitor_sku": "COMP-ID-01"
     }
-  }
+  },
+  "target_competitor_sku": "123456789",
+  "target_competitor_url": "https://www.ozon.ru/product/123456789",
+  "competitor_price_override": 1450.0
 }
