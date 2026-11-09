@@ -154,7 +154,7 @@ ozon_smart_agent/
 └── README.ru.md
 ```
 
-The `data/portfolio_ozon.json` file is intentionally excluded from Git: it may contain product costs and other commercial information. If the file does not exist yet, the application starts with an empty catalog. When running through Docker Compose, the local `data/` directory is mounted into the container, so the catalog remains on the computer after the container restarts.
+The repository includes a sample catalog with demonstration product data. It can be used as a starting point for testing the application. Do not store real commercial data or confidential business information in the tracked sample file.
 
 ### How Data Flows Through the Application
 
