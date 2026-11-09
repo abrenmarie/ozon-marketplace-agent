@@ -1,0 +1,25 @@
+[project]
+name = "ozon-smart-agent"
+version = "0.2.0"
+description = "Local unit economics and pricing decision-support prototype"
+requires-python = ">=3.11"
+dependencies = [
+    "streamlit==1.50.0",
+    "pandas==2.3.3",
+    "numpy==2.3.4",
+    "requests==2.32.5",
+    "cachetools==6.2.1",
+]
+
+[project.optional-dependencies]
+dev = ["pytest==8.4.2"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+pythonpath = ["."]
+addopts = "-ra"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"

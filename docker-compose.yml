@@ -1,11 +1,16 @@
-version: '3.8'
-
 services:
   ozon-agent:
     build: .
-    container_name: ozon_autonomous_agent
     ports:
-      - "8501:8501"
+      - "127.0.0.1:8501:8501"
+    env_file:
+      - path: .env
+        required: false
     volumes:
       - ./data:/app/data
-    restart: always
+    restart: unless-stopped
+    init: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL

@@ -5,7 +5,6 @@ __pycache__/
 .ipynb_checkpoints/
 .venv/
 venv/
-ENV/
 env/
 .DS_Store
 Thumbs.db

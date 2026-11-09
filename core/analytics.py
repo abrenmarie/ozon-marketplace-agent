@@ -1,172 +1,268 @@
-import pandas as pd
-import numpy as np
+"""Application service for competitor observations and SKU unit economics"""
+from __future__ import annotations
+
 import json
+import logging
 import os
+import re
+import threading
+from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
+from typing import Any, Mapping
+
+import numpy as np
+import pandas as pd
 import requests
+from cachetools import TTLCache
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+from core.pricing import (
+    PricingValidationError,
+    calculate_margin,
+    calculate_minimum_price,
+    calculate_net_profit,
+    calculate_roi,
+    round_money,
+)
+from domain.validation import default_portfolio, validate_portfolio
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class PriceObservation:
+    """A competitor price with its source and human-readable collection status"""
+    price: Decimal | None
+    source: str  # real, simulated, unavailable
+    status: str
+    competitor_sku: str
+
 
 class OzonSmartAgent:
-    def __init__(self):
-        self.base_dir = os.path.dirname(os.path.dirname(__file__))
-        self.config_path = os.path.join(self.base_dir, "data", "portfolio_ozon.json")
+    def __init__(self, config_path: str | None = None):
+        self.base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        self.config_path = config_path or os.path.join(self.base_dir, "data", "portfolio_ozon.json")
+        self.request_timeout = float(os.getenv("OZON_REQUEST_TIMEOUT", "4"))
+        self.cache_ttl = max(0, int(os.getenv("PRICE_CACHE_TTL_SECONDS", "120")))
+        self.demo_mode = os.getenv("DEMO_MODE", "true").strip().lower() in {"1", "true", "yes", "on"}
+        self._price_cache: TTLCache = TTLCache(maxsize=512, ttl=max(1, self.cache_ttl))
+        self._cache_lock = threading.RLock()
+        self._session = self._build_session()
         self.load_config()
 
-    def load_config(self):
-        if os.path.exists(self.config_path):
-            with open(self.config_path, "r", encoding="utf-8") as f:
-                self.config = json.load(f)
-        else:
-            self.config = {"currency": "RUB", "tax_rate": 0.06, "products": {}}
+    @staticmethod
+    def _build_session() -> requests.Session:
+        retry_total = max(0, int(os.getenv("OZON_RETRY_TOTAL", "2")))
+        retry = Retry(
+            total=retry_total,
+            connect=retry_total,
+            read=retry_total,
+            status=retry_total,
+            backoff_factor=0.35,
+            status_forcelist=(429, 500, 502, 503, 504),
+            allowed_methods=frozenset({"GET"}),
+            respect_retry_after_header=True,
+            raise_on_status=False,
+        )
+        adapter = HTTPAdapter(max_retries=retry, pool_connections=8, pool_maxsize=8)
+        session = requests.Session()
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+        session.headers.update({
+            "User-Agent": "OzonSmartAgent/0.2 (local decision-support prototype)",
+            "Accept-Language": "ru-RU,ru;q=0.9",
+        })
+        return session
 
-    def fetch_real_ozon_price(self, competitor_sku: str) -> float:
-        # пытается спарсить реальную цену товара Ozon по его SKU/артикулу, если Ozon блокирует запрос или SKU некорректный, возвращает None
-        if not competitor_sku or competitor_sku.startswith("COMP-"):
+    def load_config(self) -> None:
+        if not os.path.exists(self.config_path):
+            self.config = default_portfolio()
+            return
+        with open(self.config_path, "r", encoding="utf-8") as config_file:
+            self.config = validate_portfolio(json.load(config_file))
+
+    @staticmethod
+    def _parse_price(raw_price: Any) -> Decimal | None:
+        normalized = re.sub(r"[\s\u00a0\u200b₽]", "", str(raw_price)).replace(",", ".")
+        normalized = re.sub(r"[^\d.]", "", normalized)
+        if not normalized:
             return None
-
-        # обращение к публичному веб-API Ozon
-        url = f"https://api.ozon.ru/composer-api.bx/page/json/v2?url=/product/{competitor_sku}"
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept-Language": "ru-RU,ru;q=0.9"
-        }
-        
         try:
-            response = requests.get(url, headers=headers, timeout=4)
-            if response.status_code == 200:
-                data = response.json()
-                widgets = data.get("widgetStates", {})
-                for widget_key, widget_val in widgets.items():
-                    if "webPrice" in widget_key:
-                        price_data = json.loads(widget_val)
-                        price_str = price_data.get("price", "").replace(" ", "").replace("₽", "").replace("\u200b", "")
-                        if price_str.isdigit():
-                            return float(price_str)
-        except Exception:
-            pass  # при любой ошибке парсинга срабатывает фоллбек
-            
-        return None
+            value = Decimal(normalized)
+        except InvalidOperation:
+            return None
+        return value if value.is_finite() and value > 0 else None
 
-    def simulate_osint_competitors(self) -> dict:
-        # модуль OSINT-разведки сначала пытается получить реальные цены конкурентов по SKU через Ozon API, а если не получается, то переходит на симуляцию рыночных колебаний
+    def fetch_real_ozon_price(self, competitor_sku: str) -> PriceObservation:
+        if not competitor_sku:
+            return PriceObservation(None, "unavailable", "Не указан SKU конкурента", "")
+        if competitor_sku.startswith("COMP-"):
+            return PriceObservation(None, "unavailable", "Демо-SKU не запрашивается", competitor_sku)
+
+        with self._cache_lock:
+            cached = self._price_cache.get(competitor_sku)
+        if cached is not None:
+            return cached
+
+        url = f"https://api.ozon.ru/composer-api.bx/page/json/v2?url=/product/{competitor_sku}"
+        try:
+            response = self._session.get(url, timeout=(self.request_timeout, self.request_timeout))
+            response.raise_for_status()
+            payload = response.json()
+            widgets = payload.get("widgetStates", {}) if isinstance(payload, dict) else {}
+            if not isinstance(widgets, dict):
+                widgets = {}
+            for widget_key, widget_value in widgets.items():
+                if "webPrice" not in widget_key:
+                    continue
+                price_data = json.loads(widget_value) if isinstance(widget_value, str) else widget_value
+                if not isinstance(price_data, dict):
+                    continue
+                price = self._parse_price(price_data.get("price", ""))
+                if price is not None:
+                    observation = PriceObservation(price, "real", "Получена с публичной страницы Ozon", competitor_sku)
+                    if self.cache_ttl:
+                        with self._cache_lock:
+                            self._price_cache[competitor_sku] = observation
+                    return observation
+            observation = PriceObservation(None, "unavailable", "Цена не найдена в ответе Ozon", competitor_sku)
+        except (requests.RequestException, ValueError, TypeError, json.JSONDecodeError) as error:
+            logger.warning("Ozon price lookup failed for SKU %s: %s", competitor_sku, error)
+            observation = PriceObservation(None, "unavailable", "Не удалось получить цену с Ozon", competitor_sku)
+
+        # Cache negative results briefly to avoid hammering an unavailable endpoint.
+        if self.cache_ttl:
+            with self._cache_lock:
+                self._price_cache[competitor_sku] = observation
+        return observation
+
+    def collect_competitor_prices(self) -> dict[str, PriceObservation]:
+        """Fetch observations; demo prices are explicitly marked and never drive repricing."""
         self.load_config()
-        competitor_prices = {}
-
+        observations: dict[str, PriceObservation] = {}
         for sku, info in self.config.get("products", {}).items():
-            comp_sku = info.get("target_competitor_sku", "")
-            curr_price = float(info.get("current_price", 1000.0))
+            competitor_sku = info.get("target_competitor_sku", "")
+            observation = self.fetch_real_ozon_price(competitor_sku)
+            if observation.price is None and competitor_sku.startswith("COMP-") and self.demo_mode:
+                current_price = Decimal(str(info["current_price"]))
+                simulated = max(Decimal("100"), current_price * (
+                    Decimal("1") + Decimal(str(np.random.uniform(-0.07, 0.03)))
+                )).quantize(Decimal("0.01"))
+                observation = PriceObservation(
+                    simulated, "simulated", "Демо-симуляция: не использовать для решения о цене", competitor_sku
+                )
+            observations[sku] = observation
+        return observations
 
-            real_price = self.fetch_real_ozon_price(comp_sku) if comp_sku else None
+    # Backward-compatible method name used by earlier app versions
+    def simulate_osint_competitors(self) -> dict[str, PriceObservation]:
+        return self.collect_competitor_prices()
 
-            if real_price and real_price > 0:
-                competitor_prices[comp_sku] = real_price
-            else:
-                random_shift = np.random.uniform(-0.07, 0.03) * curr_price
-                simulated_price = max(100.0, curr_price + random_shift)
-                
-                key_name = comp_sku if comp_sku else f"COMP-{sku}"
-                competitor_prices[key_name] = round(simulated_price, 2)
+    @staticmethod
+    def _normalize_observation(value: Any, fallback_sku: str) -> PriceObservation:
+        if isinstance(value, PriceObservation):
+            return value
+        if isinstance(value, (int, float, Decimal)) and not isinstance(value, bool):
+            try:
+                price = Decimal(str(value))
+                if price.is_finite() and price > 0:
+                    return PriceObservation(price, "real", "Передано вызывающим кодом", fallback_sku)
+            except InvalidOperation:
+                pass
+        return PriceObservation(None, "unavailable", "Цена конкурента недоступна", fallback_sku)
 
-        return competitor_prices
-
-    def calculate_unit_economics(self, competitor_prices: dict) -> pd.DataFrame:
+    def calculate_unit_economics(self, competitor_prices: Mapping[str, Any]) -> pd.DataFrame:
         self.load_config()
-        results = []
-        tax_rate = float(self.config.get("tax_rate", 0.06))
-        
-        for sku, info in self.config.get("products", {}).items():
-            cost = float(info.get("cost_price", 0.0))
-            current_price = float(info.get("current_price", 0.0))
-            commission_pct = float(info.get("ozon_commission_pct", 0.0))
-            logistics = float(info.get("logistics_fbo", 0.0))
-            min_margin_pct = float(info.get("min_margin_pct", 0.0))
-            stock = int(info.get("stock", 0))
+        rows: list[dict[str, Any]] = []
+        tax_rate = Decimal(str(self.config["tax_rate"]))
 
-            commission = current_price * commission_pct
-            tax = current_price * tax_rate
-            
-            revenue = current_price
-            expenses = cost + commission + logistics + tax
-            net_profit = revenue - expenses
-            margin_pct = net_profit / current_price if current_price > 0 else 0.0
-            roi = net_profit / cost if cost > 0 else 0.0
-            
-            comp_sku = info.get("target_competitor_sku", f"COMP-{sku}")
-            comp_price = competitor_prices.get(comp_sku, current_price)
-            
-            # стратегия демпинга перебить цену конкурента на 10 рублей
-            target_pricing = comp_price - 10.0
-            
-            # нижний порог цены P_min
-            denominator = 1.0 - commission_pct - tax_rate - min_margin_pct
-            min_allowed_price = (cost + logistics) / denominator if denominator > 0 else (cost + logistics)
-            
-            if target_pricing >= min_allowed_price:
-                recommended_price = target_pricing
-                repricing_action = "MATCH_COMPETITOR_LOWER"
-            else:
-                recommended_price = min_allowed_price
-                repricing_action = "HOLD_MIN_MARGIN_LIMIT"
-                
-            results.append({
+        for sku, info in self.config["products"].items():
+            try:
+                cost = Decimal(str(info["cost_price"]))
+                current_price = Decimal(str(info["current_price"]))
+                commission = Decimal(str(info["ozon_commission_pct"]))
+                logistics = Decimal(str(info["logistics_fbo"]))
+                minimum_margin = Decimal(str(info["min_margin_pct"]))
+                stock = int(info["stock"])
+
+                profit = calculate_net_profit(current_price, cost, commission, logistics, tax_rate)
+                margin = calculate_margin(profit, current_price)
+                roi = calculate_roi(profit, cost)
+                min_price = calculate_minimum_price(cost, logistics, commission, tax_rate, minimum_margin)
+
+                competitor_sku = info.get("target_competitor_sku") or f"COMP-{sku}"
+                observation = self._normalize_observation(competitor_prices.get(sku), competitor_sku)
+
+                recommended_price: Decimal | None = None
+                if observation.source == "real" and observation.price is not None:
+                    target_price = observation.price - Decimal("10.00")
+                    if target_price >= min_price:
+                        recommended_price = target_price.quantize(Decimal("0.01"))
+                        action = "MATCH_COMPETITOR_LOWER"
+                    else:
+                        recommended_price = round_money(min_price)
+                        action = "HOLD_MIN_MARGIN_LIMIT"
+                elif observation.source == "simulated":
+                    action = "SIMULATION_ONLY"
+                else:
+                    action = "PRICE_DATA_UNAVAILABLE"
+
+            except (PricingValidationError, InvalidOperation, ValueError, TypeError) as error:
+                raise PricingValidationError(f"SKU {sku!r}: {error}") from error
+
+            rows.append({
                 "SKU": sku,
-                "Название товара": info.get("name", "Без названия"),
+                "Название товара": info["name"],
                 "Остаток (шт)": stock,
-                "Себестоимость": round(cost, 2),
-                "Текущая цена": round(current_price, 2),
-                "Цена конкурента": round(comp_price, 2),
-                "Реком. цена": round(recommended_price, 2),
-                "Стратегия": repricing_action,
-                "Net Profit": round(net_profit, 2),
-                "Margin %": round(margin_pct, 4),
-                "ROI %": round(roi, 4),
-                "Stock Left": stock
+                "Себестоимость": float(round_money(cost)),
+                "Текущая цена": float(round_money(current_price)),
+                "SKU конкурента": competitor_sku,
+                "Цена конкурента": float(round_money(observation.price)) if observation.price is not None else None,
+                "Источник цены": observation.source,
+                "Статус данных": observation.status,
+                "Мин. допустимая цена": float(round_money(min_price)),
+                "Реком. цена": float(recommended_price) if recommended_price is not None else None,
+                "Стратегия": action,
+                "Net Profit": float(round_money(profit)),
+                "Маржа, %": float((margin * 100).quantize(Decimal("0.01"))),
+                "ROI, %": float((roi * 100).quantize(Decimal("0.01"))) if roi is not None else None,
+                "Stock Left": stock,
             })
-            
-        return pd.DataFrame(results)
+        return pd.DataFrame(rows)
 
-    def generate_ai_seo_content(self, sku: str) -> dict:
+    def generate_ai_seo_content(self, sku: str) -> dict[str, str]:
         self.load_config()
-        product = self.config.get("products", {}).get(sku)
+        product = self.config["products"].get(sku)
         if not product:
             return {"description": "Товар не найден в конфигурации.", "keywords": ""}
-            
-        name = product.get("name", "Товар")
+        name = product["name"]
         description = (
-            f"Премиальный продукт '{name}' высочайшего качества. "
-            f"Разработан с учетом современных стандартов эргономики и надежности. "
-            f"Идеально подходит как для повседневного использования, так и в качестве подарка. "
-            f"Гарантия долговечности и оригинального качества."
+            f"Премиальный продукт '{name}' высочайшего качества."
+            "Разработан с учетом современных стандартов эргономики и надежности."
+            "Идеально подходит как для повседневного использования, так и в качестве подарка."
+            "Гарантия долговечности и оригинального качества."
         )
-        
-        keywords_base = [w.strip().lower() for w in name.split() if len(w) > 2]
+        keywords_base = [word.strip().lower() for word in name.split() if len(word) > 2]
         keywords = ", ".join(keywords_base + ["подарок", "премиум качество", "быстрая доставка fbo", "оригинал"])
-        
-        return {
-            "description": description,
-            "keywords": keywords
-        }
+        return {"description": description, "keywords": keywords}
 
-    def generate_executive_advice(self, df_analytics: pd.DataFrame) -> list:
-        advice_list = []
-        if df_analytics.empty:
-            return ["Добавьте товары в реестр для получения рекомендаций."]
-
-        for _, row in df_analytics.iterrows():
-            sku = row["SKU"]
-            stock = row["Stock Left"]
-            strategy = row["Стратегия"]
-            margin = row["Margin %"]
-            
+    def generate_executive_advice(self, analytics: pd.DataFrame) -> list[str]:
+        if analytics.empty:
+            return ["Каталог пока пуст."]
+        advice: list[str] = []
+        for _, row in analytics.iterrows():
+            sku, stock, strategy = row["SKU"], int(row["Stock Left"]), row["Стратегия"]
+            if float(row["Net Profit"]) < 0:
+                advice.append(f"LOSS RISK: SKU {sku}: отрицательная прибыль с единицы.")
             if stock <= 5:
-                advice_list.append(f"CRITICAL STOCK: У товара {sku} осталось всего {stock} шт. Срочно оформите заявку на поставку FBO, чтобы избежати падения в выдаче.")
+                advice.append(f"CRITICAL STOCK: SKU {sku}: осталось {stock} шт.")
             elif stock > 40:
-                advice_list.append(f"OVERSTOCK NOTICE: Высокий остаток товара {sku} ({stock} шт.). Рекомендуется подключить участие в акциях Ozon или установить скидку.")
-                
+                advice.append(f"OVERSTOCK NOTICE: SKU {sku}: остаток {stock} шт.; проверьте оборачиваемость.")
             if strategy == "HOLD_MIN_MARGIN_LIMIT":
-                advice_list.append(f"MARGIN GUARD TRIGGERED: Конкурент по {sku} опустил цену ниже допустимого. Система заблокировала цену для защиты минимальной маржи.")
-            elif margin > 0.30:
-                advice_list.append(f"HIGH PERFORMANCE: Товар {sku} показывает отличную маржинальность ({int(margin*100)}%). Рекомендуется увеличить рекламный budget в Трафаретах Ozon.")
-                
-        if not advice_list:
-            advice_list.append("Все финансовые показатели и запасы находятся в пределах нормы.")
-            
-        return advice_list
+                advice.append(f"MARGIN GUARD TRIGGERED: SKU {sku}: конкурентная цена ниже безопасного порога.")
+            elif strategy == "SIMULATION_ONLY":
+                advice.append(f"PRICE DATA SIMULATED: SKU {sku}: демо-цена не используется для рекомендации.")
+            elif strategy == "PRICE_DATA_UNAVAILABLE":
+                advice.append(f"PRICE DATA UNAVAILABLE: SKU {sku}: нет подтвержденной цены конкурента.")
+        return advice or ["Критичных сигналов по текущим правилам не обнаружено."]

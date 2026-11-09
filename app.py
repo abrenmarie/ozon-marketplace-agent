@@ -1,325 +1,387 @@
+from __future__ import annotations
+
+import datetime as dt
 import json
+import logging
 import os
-import datetime
-import numpy as np
+import tempfile
+from pathlib import Path
+
 import pandas as pd
 import streamlit as st
-from core.analytics import OzonSmartAgent
+
+from core.analytics import OzonSmartAgent, PriceObservation
+from core.pricing import PricingValidationError, calculate_margin, calculate_minimum_price, calculate_net_profit
+from domain.validation import ConfigurationValidationError, default_portfolio, validate_portfolio, validate_product
 
 st.set_page_config(
-    page_title="Ozon Smart Agent — ИИ-Автопилот",
-    page_icon="🤖",
-    layout="wide"
+    page_title="Ozon Smart Agent",
+    layout="wide",
+    initial_sidebar_state="collapsed",
 )
 
-CONFIG_PATH = os.path.join("data", "portfolio_ozon.json")
+BASE_DIR = Path(__file__).resolve().parent
+CONFIG_PATH = BASE_DIR / "data" / "portfolio_ozon.json"
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(name)s %(message)s")
+logger = logging.getLogger(__name__)
 
-def load_config():
-    if "config" not in st.session_state:
-        if os.path.exists(CONFIG_PATH):
-            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-                st.session_state.config = json.load(f)
-        else:
-            st.session_state.config = {"currency": "RUB", "tax_rate": 0.06, "products": {}}
+st.markdown("""
+<style>
+/* Hide Streamlit top header */
+[data-testid="stHeader"] {
+    display: none;
+}
 
-def save_config():
-    os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
-    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-        json.dump(st.session_state.config, f, ensure_ascii=False, indent=2)
-    st.session_state.agent = OzonSmartAgent()
-    st.toast("Конфигурация успешно сохранена и агентом подхвачена!", icon="💾")
+/* Hide Streamlit top decoration */
+[data-testid="stDecoration"] {
+    display: none;
+}
+
+/* Adjust content spacing */
+.block-container {
+    padding-top: 1.5rem;
+}
+:root { --ink:#182230; --muted:#667085; --line:#e4e7ec; --surface:#ffffff; --canvas:#f5f7fa;
+        --blue:#315b9a; --blue-soft:#edf3fb; --green:#18794e; --green-soft:#eaf6ef;
+        --red:#b42318; --red-soft:#fef0ef; --amber:#9a6700; --amber-soft:#fff7e6; }
+.stApp { background:var(--canvas); color:var(--ink); }
+.block-container { max-width:1480px; padding-top:2rem; padding-bottom:3rem; }
+h1,h2,h3 { color:var(--ink); letter-spacing:-.025em; }
+h1 { font-weight:700; }
+[data-testid="stMetric"] { background:var(--surface); border:1px solid var(--line); border-radius:12px;
+  padding:16px 18px; box-shadow:0 1px 2px rgba(16,24,40,.03); }
+[data-testid="stMetricLabel"] { color:var(--muted); font-size:.82rem; }
+[data-testid="stMetricValue"] { color:var(--ink); font-weight:700; }
+div[data-testid="stDataFrame"] { border:1px solid var(--line); border-radius:10px; overflow:hidden; }
+div[role="radiogroup"] { gap:8px; }
+div[role="radiogroup"] label { background:#fff; border:1px solid var(--line); padding:8px 14px;
+  border-radius:8px; }
+div[role="radiogroup"] label:has(input:checked) { background:var(--blue-soft); border-color:#b7c9e4; }
+.stButton>button, .stFormSubmitButton>button { border-radius:8px; font-weight:600; }
+div[data-testid="stExpander"] { border:1px solid var(--line); border-radius:10px; background:#fff; }
+.small-muted { color:var(--muted); font-size:.88rem; }
+.section-kicker { color:var(--muted); text-transform:uppercase; letter-spacing:.08em; font-size:.72rem; font-weight:700; }
+.status-pill { display:inline-block; border-radius:999px; padding:4px 9px; font-size:.78rem; font-weight:600; }
+.status-red { color:var(--red); background:var(--red-soft); }
+.status-amber { color:var(--amber); background:var(--amber-soft); }
+.status-green { color:var(--green); background:var(--green-soft); }
+.status-neutral { color:#475467; background:#eef1f4; }
+hr { border-color:var(--line); }
+</style>
+""", unsafe_allow_html=True)
+
+
+def load_config() -> bool:
+    if "config" in st.session_state:
+        return True
+    if not CONFIG_PATH.exists():
+        st.session_state.config = default_portfolio()
+        return True
+    try:
+        st.session_state.config = validate_portfolio(json.loads(CONFIG_PATH.read_text(encoding="utf-8")))
+        return True
+    except (OSError, json.JSONDecodeError, ConfigurationValidationError) as exc:
+        st.error(f"Не удалось прочитать каталог: {exc}")
+        st.stop()
+        return False
+
+
+def save_config() -> bool:
+    temporary_path = None
+    try:
+        normalized = validate_portfolio(st.session_state.config)
+        CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        fd, temporary_path = tempfile.mkstemp(dir=CONFIG_PATH.parent, prefix=".portfolio_", suffix=".json")
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(normalized, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+        os.replace(temporary_path, CONFIG_PATH)
+        st.session_state.config = normalized
+        st.session_state.agent = OzonSmartAgent(str(CONFIG_PATH))
+        st.toast("Изменения сохранены")
+        return True
+    except (OSError, TypeError, ValueError, ConfigurationValidationError) as exc:
+        if temporary_path and os.path.exists(temporary_path):
+            os.unlink(temporary_path)
+        st.error(f"Не удалось сохранить изменения: {exc}")
+        logger.exception("Portfolio save failed")
+        return False
+
+
+def ensure_agent() -> OzonSmartAgent:
+    if "agent" not in st.session_state:
+        st.session_state.agent = OzonSmartAgent(str(CONFIG_PATH))
+    return st.session_state.agent
+
+
+def get_observations() -> dict[str, PriceObservation]:
+    observations = st.session_state.get("observations")
+    if observations is None:
+        return {
+            sku: PriceObservation(None, "unavailable", "Обновление ещё не выполнялось",
+                                  product.get("target_competitor_sku", ""))
+            for sku, product in st.session_state.config["products"].items()
+        }
+    return observations
+
+
+
+def build_action_queue(analytics: pd.DataFrame) -> pd.DataFrame:
+    columns = ["Приоритет", "SKU", "Товар", "Причина", "Текущая цена", "Мин. цена", "Рекомендация", "Источник"]
+    if analytics.empty:
+        return pd.DataFrame(columns=columns)
+    items = []
+    for _, row in analytics.iterrows():
+        reasons = []
+        priority = 4
+        if row["Net Profit"] < 0:
+            reasons.append("Отрицательная прибыль с единицы")
+            priority = 1
+        if row["Текущая цена"] < row["Мин. допустимая цена"]:
+            reasons.append("Текущая цена ниже минимально допустимой")
+            priority = min(priority, 1)
+        if row["Стратегия"] == "HOLD_MIN_MARGIN_LIMIT":
+            reasons.append("Цена конкурента ниже порога маржи")
+            priority = min(priority, 1)
+        if row["Остаток (шт)"] <= 5:
+            reasons.append("Критически низкий остаток")
+            priority = min(priority, 2)
+        if row["Стратегия"] == "PRICE_DATA_UNAVAILABLE":
+            reasons.append("Нет подтвержденной цены конкурента")
+            priority = min(priority, 3)
+        if row["Стратегия"] == "SIMULATION_ONLY":
+            reasons.append("Демо-цена не является рыночным наблюдением")
+            priority = min(priority, 3)
+        if row["Стратегия"] == "MATCH_COMPETITOR_LOWER":
+            reasons.append("Можно рассмотреть снижение в пределах маржи")
+            priority = 4
+        if reasons:
+            recommendation = row["Реком. цена"]
+            if row["Стратегия"] == "HOLD_MIN_MARGIN_LIMIT":
+                recommendation = f"Не ниже {row['Мин. допустимая цена']:,.2f} ₽"
+            elif row["Стратегия"] == "SIMULATION_ONLY":
+                recommendation = "Нет – дождаться реальной цены"
+            elif row["Стратегия"] == "PRICE_DATA_UNAVAILABLE":
+                recommendation = "Нет – обновить источник"
+            elif pd.notna(row["Реком. цена"]):
+                recommendation = f"Проверить {row['Реком. цена']:,.2f} ₽"
+            items.append({
+                "Приоритет": priority, "SKU": row["SKU"], "Товар": row["Название товара"],
+                "Причина": "; ".join(reasons), "Текущая цена": row["Текущая цена"],
+                "Мин. цена": row["Мин. допустимая цена"], "Рекомендация": recommendation,
+                "Источник": row["Источник цены"],
+            })
+    queue = pd.DataFrame(items, columns=columns)
+    return queue.sort_values(["Приоритет", "SKU"]) if not queue.empty else queue
+
+
+def money_columns(frame: pd.DataFrame, columns: list[str]) -> dict:
+    return {name: st.column_config.NumberColumn(format="%.2f ₽") for name in columns}
+
 
 load_config()
+agent = ensure_agent()
+config = st.session_state.config
+products = config["products"]
+observations = get_observations()
 
-if "agent" not in st.session_state:
-    st.session_state.agent = OzonSmartAgent()
-
-if "last_osint_time" not in st.session_state:
-    st.session_state.last_osint_time = None
-
-agent = st.session_state.agent
-
-with st.sidebar:
-    st.title("🤖 ИИ-Управление Ozon")
-    st.markdown("---")
-    
-    if st.button("🚀 Запустить OSINT-сканирование", use_container_width=True, type="primary"):
-        st.session_state.competitor_prices = agent.simulate_osint_competitors()
-        st.session_state.last_osint_time = datetime.datetime.now().strftime("%H:%M:%S")
-        st.toast("Парсинг цен конкурентов завершен!", icon="📡")
+header_left, header_right = st.columns([4, 1])
+with header_left:
+    st.markdown('<div class="section-kicker">OZON SELLER DECISION SUPPORT</div>', unsafe_allow_html=True)
+    st.title("Ozon Smart Agent")
+    st.caption("Локальная панель контроля юнит-экономики и решений по ассортименту.")
+with header_right:
+    if st.button("Обновить цены", type="primary", use_container_width=True):
+        with st.spinner("Получаем доступные наблюдения..."):
+            st.session_state.observations = agent.collect_competitor_prices()
+            st.session_state.observations_updated_at = dt.datetime.now().astimezone().isoformat(timespec="seconds")
         st.rerun()
 
-    if st.session_state.last_osint_time:
-        st.caption(f"⏱️ Последнее сканирование: **{st.session_state.last_osint_time}**")
-    else:
-        st.caption("ℹ️ Нажмите кнопку выше для обновления цен конкурентов.")
+sections = ["Портфель", "Цены конкурентов", "Каталог", "Настройки"]
+if "main_navigation" not in st.session_state:
+    st.session_state.main_navigation = "Портфель"
 
-    st.markdown("---")
-    st.info("💡 Данные юнит-экономики рассчитываются в реальном времени с учетом комиссии Ozon, FBO и налогов.")
+nav_columns = st.columns(4)
+for column, section_name in zip(nav_columns, sections):
+    if column.button(
+        section_name,
+        use_container_width=True,
+        type="primary" if st.session_state.main_navigation == section_name else "secondary",
+        key=f"nav_{section_name}",
+    ):
+        st.session_state.main_navigation = section_name
+        st.rerun()
+nav = st.session_state.main_navigation
+st.divider()
 
-st.title("🛡️ Ozon Smart Agent — Панель управления и ИИ-Автопилот")
-st.markdown("---")
+analytics = agent.calculate_unit_economics(observations)
+queue = build_action_queue(analytics)
+updated_at = st.session_state.get("observations_updated_at")
+if updated_at:
+    try:
+        updated_label = dt.datetime.fromisoformat(updated_at).strftime("%d.%m.%Y %H:%M:%S %z")
+    except ValueError:
+        updated_label = updated_at
+else:
+    updated_label = "еще не обновлялись"
 
-tab_analytics, tab_osint, tab_manage = st.tabs([
-    "📊 Аналитика и Автопилот", 
-    "🕵️‍♂️ OSINT-Мониторинг", 
-    "⚙️ Управление SKU (JSON)"
-])
+st.caption(f"Источник наблюдений: публичная страница Ozon; демо-данные явно помечаются. Последнее обновление: {updated_label}.")
 
-with tab_analytics:
-    if "competitor_prices" not in st.session_state:
-        st.session_state.competitor_prices = agent.simulate_osint_competitors()
-    
-    df_analytics = agent.calculate_unit_economics(st.session_state.competitor_prices)
-    advice_list = agent.generate_executive_advice(df_analytics)
-
-    st.subheader("📈 Ключевые показатели портфеля")
-    col1, col2, col3 = st.columns(3)
-    
-    with col1:
-        total_products = len(df_analytics)
-        st.metric("Товаров в управлении (SKU)", total_products)
-        
-    with col2:
-        total_profit = df_analytics["Net Profit"].sum() if not df_analytics.empty else 0.0
-        st.metric("Прогнозируемая чистая прибыль", f"{total_profit:,.2f} ₽")
-        
-    with col3:
-        critical_stocks = len(df_analytics[df_analytics["Stock Left"] <= 5]) if not df_analytics.empty else 0
-        st.metric("Критический остаток (<= 5 шт)", critical_stocks, delta="-Требует поставки" if critical_stocks > 0 else "Запасы в норме", delta_color="inverse" if critical_stocks > 0 else "normal")
-
-    st.markdown("---")
-
-    st.subheader("🎯 ИИ-Директор: стратегические указания")
-    if advice_list:
-        for advice in advice_list:
-            if "OVERSTOCK NOTICE" in advice:
-                st.warning(f"⚠️ **Избыток запасов:** {advice.replace('OVERSTOCK NOTICE:', '')}")
-            elif "HIGH PERFORMANCE" in advice:
-                st.success(f"🔥 **Высокая маржинальность:** {advice.replace('HIGH PERFORMANCE:', '')}")
-            elif "CRITICAL" in advice or "GUARD" in advice:
-                st.error(f"🚨 **Критическая угроза:** {advice}")
-            else:
-                st.info(f"💡 **Рекомендация:** {advice}")
-    else:
-        st.info("Нет активных рекомендаций. Все показатели в норме.")
-
-    st.markdown("---")
-
-    st.subheader("🔍 Юнит-экономика и динамический репрайсинг")
-    
-    if not df_analytics.empty:
-        df_display = df_analytics.copy()
-        st.dataframe(df_display, use_container_width=True, hide_index=True)
-    else:
-        st.warning("Каталог товаров пуст. Добавьте SKU во вкладке «Управление SKU».")
-
-    st.markdown("---")
-
-    st.subheader("✍️ ИИ-Фабрика контента и SEO-оптимизация")
-    
-    if not df_analytics.empty and "SKU" in df_analytics.columns:
-        selected_sku = st.selectbox("Выберите SKU для моментальной генерации SEO-описания:", df_analytics["SKU"].tolist())
-
-        if selected_sku:
-            seo_data = agent.generate_ai_seo_content(selected_sku)
-            st.markdown(f"**Сгенерированное описание для {selected_sku}:**")
-            st.info(seo_data['description'])
-            st.markdown("**Автоматические SEO-теги и ключевые слова:**")
-            st.code(seo_data["keywords"], language="text")
-    else:
-        st.info("Добавьте товары во вкладке управления, чтобы генерировать SEO-контент.")
-
-with tab_osint:
-    st.subheader("🕵️‍♂️ Детальный мониторинг конкурентов Ozon")
-    st.caption("Отслеживание цен, ссылок на карточки и автоматический анализ демпинга.")
-
-    if "competitor_prices" not in st.session_state:
-        st.session_state.competitor_prices = agent.simulate_osint_competitors()
-
-    comp_prices = st.session_state.competitor_prices
-    products = st.session_state.config.get("products", {})
-
-    if products:
-        osint_table = []
-        for sku, info in products.items():
-            my_price = float(info.get("current_price", 0.0))
-            comp_sku = info.get("target_competitor_sku", "")
-            comp_url = info.get("target_competitor_url", "")
-
-            # если ссылки нет, но есть SKU - генерируем ссылку на Ozon
-            if not comp_url and comp_sku and not comp_sku.startswith("COMP-"):
-                comp_url = f"https://www.ozon.ru/product/{comp_sku}"
-
-            fetched_price = comp_prices.get(comp_sku, comp_prices.get(f"COMP-{sku}", my_price))
-            diff = fetched_price - my_price
-            diff_pct = (diff / my_price) * 100 if my_price > 0 else 0
-
-            if fetched_price < my_price:
-                status = "🔴 Демпинг"
-            elif abs(fetched_price - my_price) < 1.0:
-                status = "🟡 Равна вашей"
-            else:
-                status = "🟢 Выше вашей"
-
-            osint_table.append({
-                "Ваш SKU": sku,
-                "Товар": info.get("name", ""),
-                "Ваша цена": my_price,
-                "SKU Конкурента": comp_sku if comp_sku else "—",
-                "Цена конкурента": fetched_price,
-                "Разница, ₽": diff,
-                "Отклонение %": round(diff_pct, 1),
-                "Статус": status,
-                "Ссылка на Ozon": comp_url if comp_url else None
-            })
-
-        df_osint = pd.DataFrame(osint_table)
-
-        st.dataframe(
-            df_osint,
-            column_config={
-                "Ваша цена": st.column_config.NumberColumn(format="%.2f ₽"),
-                "Цена конкурента": st.column_config.NumberColumn(format="%.2f ₽"),
-                "Разница, ₽": st.column_config.NumberColumn(format="%+.2f ₽"),
-                "Отклонение %": st.column_config.NumberColumn(format="%+.1f %%"),
-                "Ссылка на Ozon": st.column_config.LinkColumn(
-                    "Карточка товара", 
-                    display_text="Открыть на Ozon 🔗"
-                )
-            },
-            use_container_width=True,
-            hide_index=True
-        )
-    else:
-        st.warning("Реестр товаров пуст. Добавьте товары во вкладке управления.")
-
-with tab_manage:
-    st.header("Редактирование реестра товаров и контроль лимитов")
-    
-    tax_rate = st.session_state.config.get("tax_rate", 0.06)
-    products = st.session_state.config.get("products", {})
-
-    st.subheader("Список текущих SKU в JSON")
-    
-    if products:
-        for sku, details in list(products.items()):
-            p_curr = float(details.get("current_price", 0.0))
-            c_cost = float(details.get("cost_price", 0.0))
-            mu_ozon = float(details.get("ozon_commission_pct", 0.0))
-            l_fbo = float(details.get("logistics_fbo", 0.0))
-            margin_min = float(details.get("min_margin_pct", 0.0))
-            
-            net_profit = p_curr * (1 - tax_rate) - c_cost - (p_curr * mu_ozon) - l_fbo
-            
-            denominator = 1.0 - mu_ozon - tax_rate - margin_min
-            p_min = (c_cost + l_fbo) / denominator if denominator > 0 else float('nan')
-
-            with st.expander(f"📦 {sku} — {details.get('name', 'Без названия')}"):
-                
-                m_col1, m_col2, m_col3 = st.columns(3)
-                with m_col1:
-                    st.metric("Текущая цена (P_current)", f"{p_curr:,.2f} ₽")
-                with m_col2:
-                    st.metric(
-                        "Чистая прибыль (Net Profit)", 
-                        f"{net_profit:,.2f} ₽", 
-                        delta=f"{(net_profit/p_curr)*100:.1f}% маржа" if p_curr > 0 else "0%"
-                    )
-                with m_col3:
-                    price_delta = p_curr - p_min if not pd.isna(p_min) else 0
-                    st.metric(
-                        "Мин. цена (P_min)", 
-                        f"{p_min:,.2f} ₽" if not pd.isna(p_min) else "Ошибка", 
-                        delta=f"{price_delta:,.2f} ₽ запас" if price_delta >= 0 else "НИЖЕ ЛИМИТА!", 
-                        delta_color="normal" if price_delta >= 0 else "inverse"
-                    )
-
-                st.markdown("---")
-
-                col1, col2, col3 = st.columns(3)
-                with col1:
-                    new_name = st.text_input("Название товара", value=details.get("name", ""), key=f"name_{sku}")
-                    new_stock = st.number_input("Остаток (шт)", value=int(details.get("stock", 0)), key=f"stock_{sku}")
-                    new_comp_sku = st.text_input("Артикул конкурента Ozon", value=details.get("target_competitor_sku", ""), key=f"comp_sku_{sku}")
-                    new_comp_url = st.text_input("Ссылка на карточку конкурента Ozon", value=details.get("target_competitor_url", ""), key=f"comp_url_{sku}")
-
-                with col2:
-                    new_cost = st.number_input("Себестоимость, ₽", value=c_cost, step=10.0, key=f"cost_{sku}")
-                    new_price = st.number_input("Текущая цена, ₽", value=p_curr, step=50.0, key=f"price_{sku}")
-                    new_commission = st.number_input("Комиссия Ozon (0.15 = 15%)", value=mu_ozon, step=0.01, format="%.2f", key=f"comm_{sku}")
-
-                with col3:
-                    new_fbo = st.number_input("Логистика FBO, ₽", value=l_fbo, step=5.0, key=f"fbo_{sku}")
-                    new_margin_limit = st.number_input("Мин. маржа (0.20 = 20%)", value=margin_min, step=0.01, format="%.2f", key=f"margin_{sku}")
-
-                btn_col1, btn_col2 = st.columns([1, 5])
-                with btn_col1:
-                    if st.button("Сохранить", key=f"save_{sku}"):
-                        st.session_state.config["products"][sku] = {
-                            "name": new_name,
-                            "stock": new_stock,
-                            "cost_price": new_cost,
-                            "current_price": new_price,
-                            "ozon_commission_pct": new_commission,
-                            "logistics_fbo": new_fbo,
-                            "min_margin_pct": new_margin_limit,
-                            "target_competitor_sku": new_comp_sku,
-                            "target_competitor_url": new_comp_url
-                        }
-                        save_config()
-                        st.rerun()
-                        
-                with btn_col2:
-                    if st.button("Удалить SKU", key=f"del_{sku}", type="secondary"):
-                        del st.session_state.config["products"][sku]
-                        save_config()
-                        st.rerun()
-    else:
-        st.info("Каталог товаров пуст. Добавьте первый SKU ниже.")
-
+if nav == "Портфель":
+    st.markdown('<div class="section-kicker">PORTFOLIO OVERVIEW</div>', unsafe_allow_html=True)
+    st.header("Состояние портфеля")
+    loss_count = int((analytics["Net Profit"] < 0).sum()) if not analytics.empty else 0
+    action_count = len(queue)
+    real_count = int((analytics["Источник цены"] == "real").sum()) if not analytics.empty else 0
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("SKU в каталоге", len(analytics))
+    k2.metric("Риск убытка", loss_count, delta="Требует внимания" if loss_count else "Не выявлен",
+              delta_color="inverse" if loss_count else "normal")
+    k3.metric("SKU в очереди действий", action_count)
+    k4.metric("Подтвержденные цены", real_count)
+    st.caption("Прибыль – расчет на одну единицу товара. Это не прогноз продаж и не прибыль по складскому остатку.")
     st.divider()
 
-    st.subheader("➕ Добавить новый SKU в систему")
-    
-    with st.form("add_sku_form", clear_on_submit=True):
-        f_col1, f_col2, f_col3 = st.columns(3)
-        
-        with f_col1:
-            add_sku = st.text_input("Артикул / SKU (уникальный ID)*", placeholder="SKU-NEW-001")
-            add_name = st.text_input("Название товара*", placeholder="Беспроводные наушники")
-            add_stock = st.number_input("Запас на складе", min_value=0, value=100)
-            add_comp_sku = st.text_input("SKU конкурента Ozon", placeholder="123456789")
-            add_comp_url = st.text_input("Ссылка на Ozon конкурента", placeholder="https://www.ozon.ru/product/123456789")
+    st.subheader("Очередь действий")
+    st.caption("Приоритеты строятся по правилам маржинальности, остаткам и достоверности конкурентных данных.")
+    if queue.empty:
+        st.success("По текущим правилам нет SKU, требующих немедленного действия.")
+    else:
+        st.dataframe(
+            queue,
+            column_config={
+                "Приоритет": st.column_config.NumberColumn(format="%d"),
+                **money_columns(queue, ["Текущая цена", "Мин. цена"]),
+            },
+            use_container_width=True, hide_index=True,
+        )
+    st.subheader("Показатели по SKU")
+    if analytics.empty:
+        st.info("Каталог пуст. Добавьте первый товар в разделе «Каталог».")
+    else:
+        portfolio_view = analytics[[
+            "SKU", "Название товара", "Остаток (шт)", "Текущая цена", "Net Profit",
+            "Маржа, %", "Мин. допустимая цена", "Реком. цена", "Источник цены", "Стратегия"
+        ]].copy()
+        st.dataframe(
+            portfolio_view,
+            column_config={
+                **money_columns(portfolio_view, ["Текущая цена", "Net Profit", "Мин. допустимая цена", "Реком. цена"]),
+                "Маржа, %": st.column_config.NumberColumn(format="%.2f %%"),
+            },
+            use_container_width=True, hide_index=True,
+        )
+elif nav == "Цены конкурентов":
+    st.markdown('<div class="section-kicker">COMPETITOR INTELLIGENCE</div>', unsafe_allow_html=True)
+    st.header("Цены конкурентов")
+    st.caption("Наблюдение не равно подтвержденному рыночному факту. Только источник real участвует в расчете рекомендации.")
+    if analytics.empty:
+        st.info("Добавьте SKU в каталоге.")
+    else:
+        competitor_view = analytics[[
+            "SKU", "Название товара", "SKU конкурента", "Текущая цена", "Цена конкурента",
+            "Источник цены", "Статус данных", "Мин. допустимая цена", "Реком. цена", "Стратегия"
+        ]]
+        st.dataframe(
+            competitor_view,
+            column_config={
+                **money_columns(competitor_view, ["Текущая цена", "Цена конкурента", "Мин. допустимая цена", "Реком. цена"]),
+            },
+            use_container_width=True, hide_index=True,
+        )
+    st.caption(f"TTL кэша наблюдений: {agent.cache_ttl} сек.")
 
-        with f_col2:
-            add_cost = st.number_input("Себестоимость, ₽*", min_value=0.0, value=500.0, step=50.0)
-            add_price = st.number_input("Продажная цена, ₽*", min_value=0.0, value=1500.0, step=100.0)
-            add_comm = st.number_input("Комиссия Ozon (0.15 = 15%)*", min_value=0.0, max_value=1.0, value=0.15, step=0.01)
+elif nav == "Каталог":
+    st.markdown('<div class="section-kicker">PRODUCT MASTER DATA</div>', unsafe_allow_html=True)
+    st.header("Каталог SKU")
+    st.caption("Изменения проходят доменную валидацию до записи в JSON.")
+    if products:
+        for sku, details in list(products.items()):
+            with st.expander(f"{sku} · {details['name']}"):
+                with st.form(f"edit_{sku}"):
+                    c1, c2, c3 = st.columns(3)
+                    name = c1.text_input("Название", details["name"])
+                    stock = c1.number_input("Остаток, шт.", min_value=0, value=int(details["stock"]), step=1)
+                    competitor_sku = c1.text_input("SKU конкурента", details["target_competitor_sku"])
+                    competitor_url = c1.text_input("Ссылка на Ozon", details["target_competitor_url"])
+                    cost = c2.number_input("Себестоимость, ₽", min_value=0.0, value=float(details["cost_price"]), step=10.0)
+                    price = c2.number_input("Текущая цена, ₽", min_value=0.01, value=float(details["current_price"]), step=10.0)
+                    commission = c2.number_input("Комиссия (доля)", min_value=0.0, max_value=0.999999, value=float(details["ozon_commission_pct"]), step=0.01, format="%.4f")
+                    logistics = c3.number_input("Логистика FBO, ₽", min_value=0.0, value=float(details["logistics_fbo"]), step=5.0)
+                    margin = c3.number_input("Минимальная маржа (доля)", min_value=0.0, max_value=0.999999, value=float(details["min_margin_pct"]), step=0.01, format="%.4f")
+                    submitted = st.form_submit_button("Сохранить изменения", type="primary")
+                if submitted:
+                    try:
+                        st.session_state.config["products"][sku] = validate_product(sku, {
+                            "name": name, "stock": stock, "target_competitor_sku": competitor_sku,
+                            "target_competitor_url": competitor_url, "cost_price": cost, "current_price": price,
+                            "ozon_commission_pct": commission, "logistics_fbo": logistics, "min_margin_pct": margin,
+                        }, config["tax_rate"])
+                        if save_config():
+                            st.rerun()
+                    except ConfigurationValidationError as exc:
+                        st.error(str(exc))
+                if st.button("Удалить SKU", key=f"delete_{sku}"):
+                    del st.session_state.config["products"][sku]
+                    if save_config():
+                        st.rerun()
+    else:
+        st.info("Каталог пока пуст.")
 
-        with f_col3:
-            add_fbo = st.number_input("Расходы FBO, ₽*", min_value=0.0, value=120.0, step=10.0)
-            add_margin = st.number_input("Целевая мин. маржа (0.20 = 20%)*", min_value=0.0, max_value=1.0, value=0.20, step=0.01)
+    st.divider()
+    st.subheader("Добавить товар")
+    with st.form("add_product", clear_on_submit=True):
+        c1, c2, c3 = st.columns(3)
+        new_sku = c1.text_input("SKU *")
+        new_name = c1.text_input("Название *")
+        new_stock = c1.number_input("Остаток, шт.", min_value=0, value=0, step=1)
+        new_comp_sku = c1.text_input("SKU конкурента")
+        new_cost = c2.number_input("Себестоимость, ₽", min_value=0.0, value=0.0, step=10.0)
+        new_price = c2.number_input("Текущая цена, ₽", min_value=0.01, value=100.0, step=10.0)
+        new_commission = c2.number_input("Комиссия (доля)", min_value=0.0, max_value=0.999999, value=0.15, step=0.01)
+        new_logistics = c3.number_input("Логистика FBO, ₽", min_value=0.0, value=0.0, step=5.0)
+        new_margin = c3.number_input("Минимальная маржа (доля)", min_value=0.0, max_value=0.999999, value=0.20, step=0.01)
+        new_url = c3.text_input("Ссылка на Ozon")
+        add = st.form_submit_button("Добавить SKU", type="primary")
+    if add:
+        normalized_sku = new_sku.strip()
+        if not normalized_sku or normalized_sku in products:
+            st.error("Укажите уникальный SKU.")
+        else:
+            try:
+                st.session_state.config["products"][normalized_sku] = validate_product(normalized_sku, {
+                    "name": new_name, "stock": new_stock, "target_competitor_sku": new_comp_sku,
+                    "target_competitor_url": new_url, "cost_price": new_cost, "current_price": new_price,
+                    "ozon_commission_pct": new_commission, "logistics_fbo": new_logistics, "min_margin_pct": new_margin,
+                }, config["tax_rate"])
+                if save_config():
+                    st.rerun()
+            except ConfigurationValidationError as exc:
+                st.error(str(exc))
 
-        submitted = st.form_submit_button("Добавить SKU в реестр", use_container_width=True)
-        
-        if submitted:
-            if not add_sku or not add_name:
-                st.error("Заполните обязательные поля: SKU и Название!")
-            elif add_sku in st.session_state.config["products"]:
-                st.error(f"SKU '{add_sku}' уже существует!")
-            else:
-                st.session_state.config["products"][add_sku] = {
-                    "name": add_name,
-                    "stock": add_stock,
-                    "cost_price": add_cost,
-                    "current_price": add_price,
-                    "ozon_commission_pct": add_comm,
-                    "logistics_fbo": add_fbo,
-                    "min_margin_pct": add_margin,
-                    "target_competitor_sku": add_comp_sku,
-                    "target_competitor_url": add_comp_url
-                }
-                save_config()
-                st.success(f"SKU {add_sku} успешно добавлен!")
+elif nav == "Настройки":
+    st.markdown('<div class="section-kicker">WORKSPACE SETTINGS</div>', unsafe_allow_html=True)
+    st.header("Настройки")
+    st.subheader("Финансовые параметры")
+    with st.form("settings_form"):
+        tax_rate = st.number_input("Налоговая ставка (доля)", min_value=0.0, max_value=0.999999,
+                                   value=float(config["tax_rate"]), step=0.01, format="%.4f")
+        save_settings = st.form_submit_button("Сохранить настройки", type="primary")
+    if save_settings:
+        try:
+            updated = dict(config)
+            updated["tax_rate"] = tax_rate
+            st.session_state.config = validate_portfolio(updated)
+            if save_config():
                 st.rerun()
+        except ConfigurationValidationError as exc:
+            st.error(str(exc))
+    st.divider()
+    st.subheader("Интеграция и надежность")
+    st.write(f"**Среда:** `{os.getenv('APP_ENV', 'local')}`")
+    st.write(f"**Демо-режим:** `{'включен' if agent.demo_mode else 'выключен'}`")
+    st.write(f"**Таймаут HTTP:** `{agent.request_timeout:g} сек.`")
+    st.write(f"**Повторные попытки:** `{os.getenv('OZON_RETRY_TOTAL', '2')}`")
+    st.write(f"**TTL кэша цен:** `{agent.cache_ttl} сек.`")
+    st.write("**Источник цен:** публичная страница Ozon; это не официальный Seller API.")
+    st.info("Панель работает локально. Не публикуйте ее в сеть без аутентификации, TLS и разграничения доступа.")

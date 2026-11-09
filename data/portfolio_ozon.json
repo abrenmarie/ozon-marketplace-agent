@@ -3,14 +3,37 @@
   "tax_rate": 0.06,
   "products": {
     "SKU-IDENTIFIER": {
-      "name": "Product Name",
+      "name": "Набор травяного чая",
       "stock": 50,
       "cost_price": 500.0,
       "current_price": 1500.0,
       "ozon_commission_pct": 0.15,
       "logistics_fbo": 100.0,
-      "min_margin_pct": 0.20,
-      "target_competitor_sku": "COMP-ID-01"
+      "min_margin_pct": 0.2,
+      "target_competitor_sku": "COMP-ID-01",
+      "target_competitor_url": ""
+    },
+    "58472284": {
+      "name": "Беспроводные наушники",
+      "stock": 100,
+      "cost_price": 500.0,
+      "current_price": 1500.0,
+      "ozon_commission_pct": 0.15,
+      "logistics_fbo": 120.0,
+      "min_margin_pct": 0.2,
+      "target_competitor_sku": "",
+      "target_competitor_url": ""
+    },
+    "9399401": {
+      "name": "Увлажнитель воздуха",
+      "stock": 100,
+      "cost_price": 500.0,
+      "current_price": 1500.0,
+      "ozon_commission_pct": 0.15,
+      "logistics_fbo": 120.0,
+      "min_margin_pct": 0.2,
+      "target_competitor_sku": "",
+      "target_competitor_url": ""
     }
   },
   "target_competitor_sku": "123456789",
