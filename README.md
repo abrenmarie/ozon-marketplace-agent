@@ -113,12 +113,21 @@ The dashboard has four main sections:
 3. **Catalog** – adding, editing, and deleting SKUs with data validation.
 4. **Settings** – the tax rate and integration parameters.
 
-| Page | Screenshot |
-|---|---|
-| Main portfolio dashboard | `docs/images/portfolio.png` |
-| Competitor price monitoring | `docs/images/competitor-prices.png` |
-| Catalog editor | `docs/images/catalogue.png` |
-| Settings | `docs/images/settings.png` |
+### Portfolio Dashboard
+
+![Portfolio Dashboard](docs/images/portfolio.png)
+
+### Competitor Price Monitoring
+
+![Competitor Prices](docs/images/competitor-prices.png)
+
+### Product Catalog
+
+![Product Catalog](docs/images/catalogue.png)
+
+### Application Settings
+
+![Application Settings](docs/images/settings.png)
 
 ## 4. Project Architecture
 
