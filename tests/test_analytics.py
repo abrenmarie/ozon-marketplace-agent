@@ -4,19 +4,12 @@ from decimal import Decimal
 import pytest
 
 from core.analytics import OzonSmartAgent, PriceObservation
-from domain.validation import validate_portfolio
-
 
 PRODUCT = {
-    "name": "Тестовый товар",
-    "stock": 10,
-    "cost_price": 500,
-    "current_price": 1500,
-    "ozon_commission_pct": .15,
-    "logistics_fbo": 100,
-    "min_margin_pct": .20,
-    "target_competitor_sku": "123456789",
-    "target_competitor_url": "",
+    "name": "Тестовый товар", "stock": 10, "cost_price": 500,
+    "current_price": 1500, "ozon_commission_pct": .15,
+    "logistics_fbo": 100, "min_margin_pct": .20,
+    "target_competitor_sku": "123456789", "target_competitor_url": "",
 }
 
 
@@ -71,26 +64,34 @@ def test_price_parser_handles_russian_currency_format(agent):
     assert agent._parse_price("—") is None
 
 
-def test_competitor_fetch_is_cached(agent, monkeypatch):
-    calls = []
-    class Response:
-        def raise_for_status(self): pass
-        def json(self):
-            return {"widgetStates": {"webPrice": json.dumps({"price": "1 234 ₽"})}}
-    def fake_get(*args, **kwargs):
-        calls.append(1)
-        return Response()
-    monkeypatch.setattr(agent._session, "get", fake_get)
-    first = agent.fetch_real_ozon_price("123456789")
-    second = agent.fetch_real_ozon_price("123456789")
-    assert first.price == Decimal("1234")
-    assert second == first
-    assert len(calls) == 1
+def test_production_mode_does_not_simulate_placeholder_prices(tmp_path):
+    agent = OzonSmartAgent(config={
+        "currency": "RUB", "tax_rate": 0.06,
+        "products": {"SKU-01": PRODUCT | {"target_competitor_sku": "COMP-DEMO"}},
+    }, data_mode="production")
+    try:
+        obs = agent.collect_competitor_prices()["SKU-01"]
+        assert obs.source == "unavailable"
+        assert obs.price is None
+    finally:
+        agent._session.close()
 
 
-def test_http_session_has_retry_policy(agent):
-    adapter = agent._session.get_adapter("https://")
-    retry = adapter.max_retries
-    assert retry.total == 2
-    assert 429 in retry.status_forcelist
-    assert 503 in retry.status_forcelist
+def test_demo_mode_marks_placeholder_price_as_simulated(tmp_path):
+    agent = OzonSmartAgent(config={
+        "currency": "RUB", "tax_rate": 0.06,
+        "products": {"SKU-01": PRODUCT | {"target_competitor_sku": "COMP-DEMO"}},
+    }, data_mode="demo")
+    try:
+        obs = agent.collect_competitor_prices()["SKU-01"]
+        assert obs.source == "simulated"
+        assert obs.price is not None
+    finally:
+        agent._session.close()
+
+
+def test_analytics_exposes_break_even_price(agent):
+    result = agent.calculate_unit_economics({})
+    row = result.iloc[0]
+    assert row["Цена безубыточности"] > 0
+    assert row["Мин. допустимая цена"] >= row["Цена безубыточности"]

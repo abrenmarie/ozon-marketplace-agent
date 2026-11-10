@@ -1,4 +1,4 @@
-"""Validation rules for product configuration and unit economics"""
+"""Validation rules for catalog records and workspace settings"""
 from __future__ import annotations
 
 import math
@@ -8,7 +8,25 @@ from urllib.parse import urlparse
 
 
 class ConfigurationValidationError(ValueError):
-    """Raised when configuration would produce unsafe or invalid calculations"""
+    """Raised when catalog data or workspace settings are invalid"""
+
+
+PRODUCT_DEFAULTS: dict[str, Any] = {
+    "name": "",
+    "stock": 0,
+    "cost_price": 0,
+    "current_price": 0,
+    "ozon_commission_pct": 0,
+    "logistics_fbo": 0,
+    "min_margin_pct": 0,
+    "target_competitor_sku": "",
+    "target_competitor_url": "",
+    "acquiring_pct": 0,
+    "storage_per_unit": 0,
+    "advertising_per_unit": 0,
+    "return_cost_per_unit": 0,
+    "other_costs_per_unit": 0,
+}
 
 
 def default_portfolio() -> dict[str, Any]:
@@ -35,11 +53,17 @@ def _optional_text(value: Any, field_name: str, max_length: int) -> str:
     return normalized
 
 
-def _number(value: Any, field_name: str, *, minimum: float, maximum: float | None = None) -> float:
+def _number(value: Any, field_name: str, *, minimum: float,
+            maximum: float | None = None) -> float:
     if isinstance(value, bool):
         raise ConfigurationValidationError(f"{field_name}: ожидается число.")
     try:
-        result = float(value)
+        normalized_value = value
+        if isinstance(value, str):
+            normalized_value = value.strip().replace("\u00a0", "").replace(" ", "")
+            if "," in normalized_value and "." not in normalized_value:
+                normalized_value = normalized_value.replace(",", ".")
+        result = float(normalized_value)
     except (TypeError, ValueError) as error:
         raise ConfigurationValidationError(f"{field_name}: ожидается число.") from error
     if not math.isfinite(result):
@@ -63,7 +87,9 @@ def _competitor_url(value: Any) -> str:
     parsed = urlparse(url)
     hostname = (parsed.hostname or "").lower()
     if parsed.scheme != "https" or not (hostname == "ozon.ru" or hostname.endswith(".ozon.ru")):
-        raise ConfigurationValidationError("Ссылка на конкурента должна быть HTTPS-ссылкой на домен ozon.ru.")
+        raise ConfigurationValidationError(
+            "Ссылка на конкурента должна быть HTTPS-ссылкой на домен ozon.ru."
+        )
     return url
 
 
@@ -72,21 +98,46 @@ def validate_product(sku: Any, product: Mapping[str, Any], tax_rate: Any) -> dic
         raise ConfigurationValidationError("Данные SKU должны быть объектом.")
     normalized_sku = _required_text(sku, "SKU", 128)
     tax = _number(tax_rate, "Налоговая ставка", minimum=0, maximum=0.999999)
-    commission = _number(product.get("ozon_commission_pct", 0), "Комиссия Ozon", minimum=0, maximum=0.999999)
-    margin = _number(product.get("min_margin_pct", 0), "Минимальная маржа", minimum=0, maximum=0.999999)
-    if commission + tax + margin >= 1:
+
+    rate_fields = {
+        "ozon_commission_pct": "Комиссия Ozon",
+        "acquiring_pct": "Эквайринг",
+        "min_margin_pct": "Целевая маржа",
+    }
+    rates = {
+        key: _number(product.get(key, PRODUCT_DEFAULTS[key]), label,
+                     minimum=0, maximum=0.999999)
+        for key, label in rate_fields.items()
+    }
+    if rates["ozon_commission_pct"] + rates["acquiring_pct"] + tax + rates["min_margin_pct"] >= 1:
         raise ConfigurationValidationError(
-            f"SKU {normalized_sku}: комиссия, налог и минимальная маржа должны быть в сумме меньше 100%."
+            f"SKU {normalized_sku}: комиссия, эквайринг, налог и целевая маржа "
+            "должны быть в сумме меньше 100%."
         )
+
+    amount_fields = {
+        "cost_price": "Себестоимость",
+        "current_price": "Текущая цена",
+        "logistics_fbo": "Логистика FBO",
+        "storage_per_unit": "Хранение на единицу",
+        "advertising_per_unit": "Реклама на единицу",
+        "return_cost_per_unit": "Расходы на возвраты на единицу",
+        "other_costs_per_unit": "Прочие расходы на единицу",
+    }
+    amounts = {
+        key: _number(product.get(key, PRODUCT_DEFAULTS[key]), label,
+                     minimum=0.01 if key == "current_price" else 0)
+        for key, label in amount_fields.items()
+    }
+
     return {
         "name": _required_text(product.get("name", ""), "Название товара", 255),
         "stock": _stock(product.get("stock", 0)),
-        "cost_price": _number(product.get("cost_price", 0), "Себестоимость", minimum=0),
-        "current_price": _number(product.get("current_price", 0), "Текущая цена", minimum=0.01),
-        "ozon_commission_pct": commission,
-        "logistics_fbo": _number(product.get("logistics_fbo", 0), "Логистика FBO", minimum=0),
-        "min_margin_pct": margin,
-        "target_competitor_sku": _optional_text(product.get("target_competitor_sku", ""), "SKU конкурента", 128),
+        **amounts,
+        **rates,
+        "target_competitor_sku": _optional_text(
+            product.get("target_competitor_sku", ""), "SKU конкурента", 128
+        ),
         "target_competitor_url": _competitor_url(product.get("target_competitor_url", "")),
     }
 

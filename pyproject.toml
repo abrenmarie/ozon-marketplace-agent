@@ -1,7 +1,7 @@
 [project]
 name = "ozon-smart-agent"
-version = "0.2.0"
-description = "Local unit economics and pricing decision-support prototype"
+version = "0.3.0"
+description = "Local seller operations toolkit for catalog economics and pricing decisions"
 requires-python = ">=3.11"
 dependencies = [
     "streamlit==1.50.0",
@@ -9,6 +9,7 @@ dependencies = [
     "numpy==2.3.4",
     "requests==2.32.5",
     "cachetools==6.2.1",
+    "openpyxl==3.1.5",
 ]
 
 [project.optional-dependencies]

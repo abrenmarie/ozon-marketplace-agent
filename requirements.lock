@@ -1,7 +1,8 @@
-# Direct-dependency lock snapshot for the application
-# For a full transitive + hash lock, regenerate with: pip-compile --generate-hashes requirements.in
+# Direct-dependency pins for the runtime image.
+# This is not a fully resolved transitive lock with hashes.
 streamlit==1.50.0
 pandas==2.3.3
 numpy==2.3.4
 requests==2.32.5
 cachetools==6.2.1
+openpyxl==3.1.5

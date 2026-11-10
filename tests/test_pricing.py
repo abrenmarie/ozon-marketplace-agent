@@ -1,19 +1,15 @@
 from decimal import Decimal
-
 import pytest
 
 from core.pricing import (
-    PricingValidationError,
-    calculate_margin,
-    calculate_minimum_price,
-    calculate_net_profit,
-    calculate_roi,
+    PricingValidationError, calculate_margin, calculate_minimum_price,
+    calculate_net_profit, calculate_roi,
 )
 
 
 def test_net_profit_uses_decimal_arithmetic():
     result = calculate_net_profit("1500.00", "500.00", "0.15", "100.00", "0.06")
-    assert result == Decimal("585.0000")
+    assert result == Decimal("585.00")
 
 
 def test_margin_is_fraction():

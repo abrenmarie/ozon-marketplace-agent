@@ -28,3 +28,15 @@ def test_invalid_product_is_rejected(changes):
 def test_impossible_margin_is_rejected():
     with pytest.raises(ConfigurationValidationError):
         validate_product("SKU", VALID | {"ozon_commission_pct": .8}, .06)
+
+
+def test_extended_expenses_default_to_zero():
+    normalized = validate_product("SKU", VALID, .06)
+    assert normalized["acquiring_pct"] == 0
+    assert normalized["storage_per_unit"] == 0
+    assert normalized["other_costs_per_unit"] == 0
+
+
+def test_commission_acquiring_tax_and_target_margin_must_fit():
+    with pytest.raises(ConfigurationValidationError):
+        validate_product("SKU", VALID | {"acquiring_pct": .2, "ozon_commission_pct": .6}, .06)
